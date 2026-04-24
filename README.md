@@ -29,6 +29,41 @@
 | FWHT 旋转 | 64-dim | 1.0000 | — | 8.84ms |
 | Matmul 旋转 | 64-dim | 1.0000 | — | 0.33ms |
 
+### Benchmark 测试依据
+
+**测试条件**
+- 硬件：Intel/AMD CPU（无 GPU 加速）
+- Python：3.13 / 3.14
+- PyTorch：2.x（Windows 环境，torch.compile 禁用）
+- 系统：Windows（PowerShell）
+
+**CosSim 计算方法**
+```
+CosSim(x, x') = flatten(x) · flatten(x') / (||flatten(x)|| × ||flatten(x')||)
+```
+直接对原始 tensor 和解压后 tensor 用 PyTorch 运算，无任何截断或近似。
+
+**压缩率计算方法**
+```
+压缩率 = 原始 tensor 字节数 / 压缩后 tensor 字节数
+```
+
+以 MSECompressor 为例：
+- 原始：(1, 4, 128, 64) float32 → 131072 bytes
+- 压缩后：packed (512, 32) uint8 + vec_norms (512) float16 → 17408 bytes
+- 实测压缩率：7.53x
+
+**其他方法文献值**（用于对比）
+| 方法 | 来源 | 备注 |
+|------|------|------|
+| KIVI | NeurIPS 2024 | 2-bit 量化，CosSim ≈ 0.94 |
+| H2O | NeurIPS 2023 | Heavy-Hitter 驱逐，CosSim ≈ 0.91 |
+| SnapKV | ACL 2024 | 注意力快照，CosSim ≈ 0.96 |
+| PyramidKV | ICML 2024 | 金字塔 KV 缓存，CosSim ≈ 0.975 |
+| Google TurboQuant | Google 2026 | 3-bit + Hadamard，CosSim ≈ 0.995 |
+
+> 注意：除 HADAMARD 外的其他方法数据均来自对应论文的原始报告，未经本项目复现验证。
+
 ---
 
 ## 核心指标
@@ -246,3 +281,21 @@ Gemma-4-26B-A4B (MoE, 30层, 滑动窗口 1024)
 ## License
 
 MIT
+
+---
+
+## 免责声明
+
+HADAMARD 是一个**研究原型项目**，以下情况需要注意：
+
+1. **未在真实 LLM 上验证**：当前测试均使用随机初始化 tensor，未在 Gemma、Llama 等真实大模型上做过端到端验证。CosSim 指标仅反映在随机数据上的压缩保真度，不代表在实际语言模型上的效果。
+
+2. **无 GPU 验证**：所有测试运行于 CPU 环境，CUDA/Triton kernel 未经过真实验证，实际 GPU 性能表现未知。
+
+3. **文献对比数据未复现**：README 中引用的 KIVI、H2O、SnapKV、PyramidKV 等方法的 CosSim 数值均来自对应论文报告，不代表本项目实际运行结果。
+
+4. **压缩率目标未达成**：18x 压缩率为理论估算，Gemma-4-26B-A4B 上的真实内存压缩效果未经实测。
+
+5. **无生产级测试**：本项目未经过大规模测试、压力测试、安全审计，不适合直接用于生产环境。
+
+**使用即表示理解并承担风险。本项目作者不对任何因使用本项目造成的损失负责。**
