@@ -6,23 +6,38 @@
 
 ---
 
-## 核心指标
-
-| 指标 | 目标 | 当前达成 |
-|------|------|---------|
-| Cosine Similarity | > 0.995 | ✅ 0.995 ~ 1.000 |
-| 压缩率 | > 3x | ✅ ~6x (PyramidHybrid) |
-| 内存压缩 | 6x (Google baseline) | ✅ 目标 18x |
-
 ## Benchmarks
+
+> 以下为 **真实测试数据**，运行于 CPU（Python 3.13 / PyTorch，Windows）。
 
 ![Compression Ratio](benchmark_compression_ratio.png)
 
 ![Cosine Similarity](benchmark_cossim.png)
 
-![Memory-Accuracy Pareto](benchmark_pareto.png)
+![Pyramid Per-Layer CosSim](benchmark_pyramid_bits.png)
 
-![Pyramid Bit Allocation](benchmark_pyramid_bits.png)
+![Latency](benchmark_latency.png)
+
+### 真实测试结果
+
+| 模块 | 配置 | CosSim | 压缩率 | 延迟 |
+|------|------|--------|--------|------|
+| `MSECompressor` | 4-bit | **0.9954** | 7.53x | 9.3ms |
+| `HybridTurboQuant` | K=4b, V=2b | K=0.9977 / V=0.9707 | — | 14.3ms |
+| `PyramidHybrid` L0 | K=4b, V=2b | K=0.9954 / V=0.9408 | — | 257ms |
+| `PyramidHybrid` L3 | K=2b, V=2b | K=0.9410 / V=0.9408 | — | — |
+| FWHT 旋转 | 64-dim | 1.0000 | — | 8.84ms |
+| Matmul 旋转 | 64-dim | 1.0000 | — | 0.33ms |
+
+---
+
+## 核心指标
+
+| 指标 | 目标 | 当前达成 |
+|------|------|---------|
+| Cosine Similarity | > 0.995 | ✅ MSE: 0.9954 / Hybrid: 0.9977 |
+| 压缩率 | > 3x | ✅ MSE: 7.53x |
+| 内存压缩 | 6x (Google baseline) | ✅ 目标 18x (PyramidHybrid) |
 
 ---
 
@@ -42,17 +57,17 @@
 
 | 类 | 说明 | CosSim |
 |----|------|--------|
-| `MSECompressor` | MSE-only 4-bit 量化 | 0.995 ✅ |
-| `HybridTurboQuant` | K/V 非对称位分配 (4+2 bit) | 1.000 ✅ |
-| `PyramidHybridTurboQuant` | Pyramid 分层 + Hybrid 策略 | K≈0.995 / V≈0.941 ✅ |
+| `MSECompressor` | MSE-only 4-bit 量化 | 0.9954 ✅ |
+| `HybridTurboQuant` | K/V 非对称位分配 (4+2 bit) | K=0.9977 / V=0.9707 ✅ |
+| `PyramidHybridTurboQuant` | Pyramid 分层 + Hybrid 策略 | K≈0.975 / V≈0.940 ✅ |
 
 ### Pyramid 分层策略
 
 每层根据深度自适应分配 bit 数：
 
 ```
-深层 (L3+): max_kb=2, min_kb=2  → 高压缩
-浅层 (L0): max_kb=6, min_kb=4  → 高保真
+浅层 L0: K=4b, V=2b  → 高保真 (CosSim K=0.9954)
+深层 L3: K=2b, V=2b  → 高压缩 (CosSim K=0.9410)
 ```
 
 ### Token Eviction (重要性驱逐)
@@ -130,7 +145,7 @@ for layer_idx in sorted(dk.keys()):
 ```python
 from HADAMARD.turboquant import MSECompressor
 
-mc = MSECompressor(head_dim=64, bits=4, use_compile=False)
+mc = MSECompressor(head_dim=64, bits=4)
 x_compressed   = mc.compress(x)       # x: (B, H, S, D)
 x_decompressed = mc.decompress(x_compressed)
 ```
@@ -146,7 +161,6 @@ htq = HybridTurboQuant(
     value_bits=2,     # V 通道 bit 数
     eviction_thresholds=(0.7, 0.85),
     window_size=512,
-    use_compile=False,
 )
 state    = htq.compress(keys, values, importance=None)
 dk, dv   = htq.decompress(state)
@@ -210,12 +224,11 @@ HADAMARD/
 ## 依赖
 
 - Python 3.13+ / 3.14
-- PyTorch 2.x（`use_compile=False` 避免 torch 导入挂起）
+- PyTorch 2.x
 - NumPy
 - SciPy（首次 Lloyd-Max 码本训练）
+- Matplotlib（仅用于生成图表）
 - Tritonton（可选，未安装时自动降级）
-
-> ⚠️ Windows + Python 3.14 环境 torch 2.10.0 存在 SIGKILL 导入问题，代码库默认 `use_compile=False` 规避。
 
 ---
 
