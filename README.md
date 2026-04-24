@@ -14,6 +14,16 @@
 | 压缩率 | > 3x | ✅ ~6x (PyramidHybrid) |
 | 内存压缩 | 6x (Google baseline) | ✅ 目标 18x |
 
+## Benchmarks
+
+![Compression Ratio](benchmark_compression_ratio.png)
+
+![Cosine Similarity](benchmark_cossim.png)
+
+![Memory-Accuracy Pareto](benchmark_pareto.png)
+
+![Pyramid Bit Allocation](benchmark_pyramid_bits.png)
+
 ---
 
 ## 核心模块
