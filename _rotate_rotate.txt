@@ -1,0 +1,44 @@
+def rotate(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        rotate(x) = x @ Q^T = (x ⊙ sign) @ H / √d
+        """
+        if x.device != self.device:
+            x = x.to(self.device)
+        if self.mode == "matmul":
+            if x.dim() == 1:
+                return (x * self.signs) @ self._Q_T
+            else:
+                return (x * self.signs.view(1, -1)) @ self._Q_T
+        else:
+            # FWHT 路径：分层归一化防溢出
+            return self._rotate_fwht(x)
+
+    def unrotate(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        unrotate(y) = y @ Q = (H @ y) ⊙ sign / √d
+        """
+        if y.device != self.device:
+            y = y.to(self.device)
+        if self.mode == "matmul":
+            if y.dim() == 1:
+                return (torch.mv(self._Q_T.t(), y) * self.signs)
+            else:
+                return (torch.mm(y, self._Q_T.t()) * self.signs.view(1, -1))
+        else:
+            return self._unrotate_fwht(y)
+
+    def _rotate_fwht(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        FWHT 旋转：x ⊙ sign → butterfly → ⊙ sign / √d
+
+        x ⊙ sign → butterfly → ⊙ sign / √d
+        = (H @ (x ⊙ sign)) ⊙ sign / √d
+        = (x ⊙ sign) @ H ⊙ sign / √d（因为 H 对称）
+        = x @ Q^T ✓
+        """
+        xr = x * self.signs
+        self._fwht分层(xr)
+        xr = xr * self.signs / self._sqrt_d
+        return xr
+
+    def _unrotate_fwht(self, y: torch.Tensor) -> torch

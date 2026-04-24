@@ -1,0 +1,1203 @@
+"""
+TurboQuant 智能入口
+====================
+自动探测硬件环境，选择最优后端，用户无需关心细节。
+
+支持三种压缩模式：
+  standard  — 均匀分配（baseline，各层相同 bits）
+  pyramid   — 金字塔分配（浅层多 bits，深层少 bits）
+  hybrid    — SnapKV 驱逐 + TurboQuant 量化（乘数效应 ~13x）
+
+用法：
+  # 标准模式
+  >>> kv = TurboQuantPipeline.create(head_dim=128, key_bits=4, value_bits=2)
+
+  # 金字塔模式（自动层分配）
+  >>> kv = PyramidPipeline.create(n_layers=30, head_dim=128)
+
+  # 混合模式（驱逐+量化）
+  >>> kv = HybridPipeline.create(n_layers=30, head_dim=128, retention_ratio=0.2)
+  >>> kv.track_attention(q, k)           # 推理时追踪
+  >>> compressed = kv.compress_kv(keys, values)
+
+支持的环境变量：
+  TURBOQUANT_BACKEND=triton|gpu|cpu  ← 强制指定后端
+  TURBOQUANT_DEVICE=cuda:0            ← 指定 GPU 设备
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import math
+import threading
+from typing import Optional, Tuple, List, Literal, Dict, Any
+
+import torch
+
+
+# ===========================================================================
+# 第一步：收集环境信息（零侵入，失败不报错）
+# ===========================================================================
+
+class EnvironmentInfo:
+    """
+    零侵入环境探测。宁可少报也不崩溃。
+    """
+    __slots__ = ("cuda_available", "gpu_count", "triton_available",
+                 "selected_device", "cpu_count", "pytorch_version",
+                 "_forced_backend", "_forced_device", "triton_version")
+
+    _instance: Optional['EnvironmentInfo'] = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._probe()
+        return cls._instance
+
+    def _probe(self):
+        self.cuda_available = torch.cuda.is_available()
+        self.gpu_count = torch.cuda.device_count() if self.cuda_available else 0
+
+        self.triton_available = False
+        if self.cuda_available:
+            try:
+                import triton as _triton
+                self.triton_version = getattr(_triton, '__version__', 'unknown')
+                self.triton_available = True
+            except (ImportError, OSError):
+                self.triton_version = "未安装"
+
+        try:
+            self.cpu_count = os.cpu_count() or 4
+        except Exception:
+            self.cpu_count = 4
+
+        self.pytorch_version = getattr(torch, '__version__', 'unknown')
+        self._forced_backend = os.environ.get("TURBOQUANT_BACKEND", "").lower()
+        self._forced_device = os.environ.get("TURBOQUANT_DEVICE", "")
+
+        if self._forced_device:
+            self.selected_device = self._forced_device
+        elif self.cuda_available:
+            self.selected_device = "cuda:0"
+        else:
+            self.selected_device = "cpu"
+
+    @property
+    def backend(self) -> str:
+        if self._forced_backend:
+            return self._forced_backend
+        if self.triton_available and self.cuda_available:
+            return "triton"
+        if self.cuda_available:
+            return "gpu_matmul"
+        return "cpu_matmul"
+
+    def summary(self) -> dict:
+        return {
+            "backend": self.backend,
+            "device": self.selected_device,
+            "cuda_available": self.cuda_available,
+            "gpu_count": self.gpu_count,
+            "triton_available": self.triton_available,
+            "cpu_count": self.cpu_count,
+            "pytorch_version": self.pytorch_version,
+            "forced_by_env": bool(self._forced_backend),
+        }
+
+    def print_report(self):
+        info = self.summary()
+        print("═" * 52)
+        print("  TurboQuant 环境探测报告")
+        print("═" * 52)
+        print(f"  PyTorch:     {info['pytorch_version']}")
+        print(f"  CUDA:        {'✅ 可用' if info['cuda_available'] else '❌ 不可用'}  "
+              f"({info['gpu_count']} GPU)" if info['cuda_available'] else "")
+        print(f"  Triton:      {'✅ 可用' if info['triton_available'] else '❌ 未安装'}")
+        print(f"  CPU cores:   {info['cpu_count']}")
+        print(f"  选定后端:    {info['backend']}")
+        print(f"  运行设备:    {info['device']}")
+        if info['forced_by_env']:
+            print(f"  ⚠️  后端被环境变量覆盖")
+        print("═" * 52)
+
+
+_env = None
+
+
+def get_env() -> EnvironmentInfo:
+    global _env
+    if _env is None:
+        _env = EnvironmentInfo()
+    return _env
+
+
+# ===========================================================================
+# 第二步：后端抽象
+# ===========================================================================
+
+class RotationBackend:
+    """旋转操作抽象基类。"""
+    name: str = "base"
+
+    def rotate(self, x: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def unrotate(self, y: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def memory_bytes(self, d: int) -> int:
+        return 0
+
+
+class CPUMatmulBackend(RotationBackend):
+    name = "cpu_matmul"
+
+    def __init__(self, d: int, seed: int = 42, device: str = "cpu"):
+        from rotation import generate_rotation_matrix
+        self._rot = generate_rotation_matrix(d, seed=seed, device=device, mode="matmul")
+
+    def rotate(self, x: torch.Tensor) -> torch.Tensor:
+        return self._rot.rotate(x)
+
+    def unrotate(self, y: torch.Tensor) -> torch.Tensor:
+        return self._rot.unrotate(y)
+
+    def memory_bytes(self, d: int) -> int:
+        return d
+
+
+class GPUMatmulBackend(RotationBackend):
+    name = "gpu_matmul"
+
+    def __init__(self, d: int, seed: int = 42, device: str = "cuda"):
+        from rotation import generate_rotation_matrix
+        self._device = device
+        self._rot = generate_rotation_matrix(d, seed=seed, device=device, mode="matmul")
+
+    def rotate(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == "cpu":
+            x = x.to(self._device)
+        return self._rot.rotate(x)
+
+    def unrotate(self, y: torch.Tensor) -> torch.Tensor:
+        return self._rot.unrotate(y)
+
+    def memory_bytes(self, d: int) -> int:
+        return d
+
+
+class TritonBackend(RotationBackend):
+    name = "triton"
+
+    def __init__(self, d: int, bits: int, seed: int = 42, device: str = "cuda"):
+        self._d = d
+        self._bits = bits
+        self._device = device
+
+        import triton
+        import triton.language as tl
+
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(seed)
+        signs = (torch.randint(0, 2, (d,), generator=gen, dtype=torch.float32) * 2.0 - 1.0)
+        if (signs < 0).sum().item() % 2 == 1:
+            signs[0] *= -1
+        self._signs = signs.to(device)
+        self._compiled: Optional[object] = None
+        self._compile_once()
+
+    def _compile_once(self):
+        import triton
+        import triton.language as tl
+
+        @triton.autotune(
+            key=["batch"],
+            configs=[
+                triton.Config({"BLOCK_M": b}, num_warps=4, num_stages=1)
+                for b in [32, 64, 128, 256]
+            ],
+        )
+        @triton.jit
+        def triton_fwht_kernel(
+            x_ptr, signs_ptr, y_ptr,
+            stride_xb, stride_xd,
+            stride_yb, stride_yd,
+            d: tl.constexpr, d2: tl.constexpr,
+            batch: tl.constexpr, BLOCK_M: tl.constexpr,
+        ):
+            pid_b = tl.program_id(axis=0)
+            offs_d = tl.arange(0, d2)
+            x_base = pid_b * stride_xb
+            x = tl.load(x_ptr + x_base + offs_d * stride_xd)
+            signs = tl.load(signs_ptr + offs_d)
+            x = x * signs
+
+            stride = 1
+            while stride < d:
+                mask = (offs_d % (stride * 2)) < stride
+                even = tl.load(x_ptr + x_base + offs_d * stride_xd, mask=mask, other=0.0)
+                odd = tl.load(x_ptr + x_base + (offs_d ^ stride) * stride_xd, mask=mask, other=0.0)
+                x = tl.where(mask, even + odd, even - odd)
+                stride *= 2
+
+            x = x / tl.sqrt(tl.cast(d2, tl.float32))
+            x = x * signs
+            y_ptr_b = pid_b * stride_yb
+            tl.store(y_ptr + y_ptr_b + offs_d * stride_yd, x)
+
+        self._kernel = triton_fwht_kernel
+        self._compiled = True
+
+    def rotate(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+        D = x.shape[-1]
+        d2 = math.ceil(D / 32) * 32
+        out = torch.zeros(B, d2, dtype=torch.float32, device=self._device)
+        grid = lambda opts: (B,)
+        self._kernel[grid](x, self._signs, out,
+                           x.stride(0), x.stride(1),
+                           out.stride(0), out.stride(1),
+                           D, d2, B)
+        return out[:, :D]
+
+    def unrotate(self, y: torch.Tensor) -> torch.Tensor:
+        B = y.shape[0]
+        D = y.shape[-1]
+        d2 = math.ceil(D / 32) * 32
+        out = torch.zeros(B, d2, dtype=torch.float32, device=self._device)
+        grid = lambda opts: (B,)
+        self._kernel[grid](y, self._signs, out,
+                           y.stride(0), y.stride(1),
+                           out.stride(0), out.stride(1),
+                           D, d2, B)
+        return out[:, :D]
+
+    def memory_bytes(self, d: int) -> int:
+        return d
+
+
+def create_rotation_backend(
+    d: int,
+    backend: Optional[str] = None,
+    seed: int = 42,
+    device: Optional[str] = None,
+) -> RotationBackend:
+    env = get_env()
+    if backend is None:
+        backend = env.backend
+    if device is None:
+        device = env.selected_device
+
+    if backend == "triton":
+        if not env.triton_available:
+            print(f"⚠️  Triton 不可用，降级到 gpu_matmul")
+            backend = "gpu_matmul"
+        else:
+            return TritonBackend(d=d, seed=seed, device=device)
+
+    if backend == "gpu_matmul":
+        if not env.cuda_available:
+            print(f"⚠️  GPU 不可用，降级到 cpu_matmul")
+            return CPUMatmulBackend(d=d, seed=seed, device="cpu")
+        return GPUMatmulBackend(d=d, seed=seed, device=device)
+
+    if backend == "cpu_matmul":
+        return CPUMatmulBackend(d=d, seed=seed, device=device)
+
+    raise ValueError(f"未知后端: {backend}")
+
+
+# ===========================================================================
+# 第三步：基础压缩器包装（统一注入旋转后端）
+# ===========================================================================
+
+class _CompressorWrapper:
+    __slots__ = ("head_dim", "bits", "rot", "centroids", "packer",
+                 "_use_searchsorted", "_device")
+
+    def __init__(self, head_dim, bits, rot: RotationBackend, centroids, packer):
+        self.head_dim = head_dim
+        self.bits = bits
+        self.rot = rot
+        self.centroids = centroids
+        self.packer = packer
+        self._use_searchsorted = bits > 4
+        self._device = getattr(rot, '_device', 'cpu')
+
+    @property
+    def n_bytes(self) -> int:
+        return self.packer.n_bytes
+
+    @torch.no_grad()
+    def compress(self, x: torch.Tensor) -> dict:
+        B, H, S, D = x.shape
+        flat = x.reshape(-1, self.head_dim).float()
+        norms = torch.norm(flat, dim=-1)
+        flat_unit = flat / norms.unsqueeze(-1).clamp(min=1e-8)
+        rotated = self.rot.rotate(flat_unit)
+        indices = self._quantize(rotated)
+        packed = self.packer.pack(indices)
+        return {
+            "packed": packed,
+            "norms": norms.to(torch.float16),
+            "shape": (B, H, S, D),
+        }
+
+    @torch.no_grad()
+    def decompress(self, comp: dict) -> torch.Tensor:
+        packed = comp["packed"]
+        norms = comp["norms"]
+        B, H, S, D = comp["shape"]
+        N = B * H * S
+        indices = self.packer.unpack(packed.reshape(N, -1), self.head_dim)
+        recon_unit = self.centroids[indices.long()]
+        recon_unit = self.rot.unrotate(recon_unit)
+        recon = recon_unit * norms.to(recon_unit.dtype).unsqueeze(-1)
+        return recon.reshape(B, H, S, D)
+
+    def _quantize(self, x: torch.Tensor) -> torch.Tensor:
+        from turboquant import _quantize_searchsorted, _quantize_argmin
+        if self._use_searchsorted:
+            return _quantize_searchsorted(x, self.centroids)
+        return _quantize_argmin(x, self.centroids)
+
+
+# ===========================================================================
+# 第四步：TurboQuantPipeline（标准均匀模式，保持向后兼容）
+# ===========================================================================
+
+class TurboQuantPipeline:
+    """
+    标准 TurboQuant 流水线（均匀 bits 分配）。
+
+    各层使用相同 bits，适用于各层 KV 分布均匀的场景。
+    """
+
+    def __init__(
+        self,
+        head_dim: int = 128,
+        key_bits: int = 4,
+        value_bits: int = 2,
+        *,
+        backend: Optional[str] = None,
+        device: Optional[str] = None,
+        use_dynamic_window: bool = False,
+        residual_window: int = 128,
+        seed: int = 42,
+        verbose: bool = True,
+    ):
+        env = get_env()
+        self._backend_name = backend or env.backend
+        self._device = device or env.selected_device
+        self._head_dim = head_dim
+        self._key_bits = key_bits
+        self._value_bits = value_bits
+        self._use_dynamic_window = use_dynamic_window
+        self._residual_window = residual_window
+
+        self._rot_backend = create_rotation_backend(
+            d=head_dim, backend=self._backend_name,
+            seed=seed, device=self._device,
+        )
+
+        from turboquant import MSECompressor, LloydMaxCodebook, BitPacker
+
+        def make_comp(bits, seed_off):
+            codebook = LloydMaxCodebook(head_dim, bits)
+            centroids = codebook.centroids.to(self._device)
+            packer = BitPacker(head_dim, bits)
+            return _CompressorWrapper(head_dim, bits, self._rot_backend,
+                                      centroids, packer)
+
+        self._key_comp = make_comp(key_bits, 0)
+        self._val_comp = make_comp(value_bits, 999)
+
+        if verbose:
+            env_info = get_env().summary()
+            print(f"[TurboQuant] 模式=standard  后端={self._backend_name}  "
+                  f"设备={self._device}  K={key_bits}b V={value_bits}b")
+
+    @staticmethod
+    def create(
+        head_dim: int = 128,
+        key_bits: int = 4,
+        value_bits: int = 2,
+        *,
+        backend: Optional[str] = None,
+        device: Optional[str] = None,
+        use_dynamic_window: bool = False,
+        residual_window: int = 128,
+        seed: int = 42,
+        verbose: bool = True,
+        report: bool = False,
+    ) -> 'TurboQuantPipeline':
+        if report:
+            get_env().print_report()
+        return TurboQuantPipeline(
+            head_dim=head_dim, key_bits=key_bits, value_bits=value_bits,
+            backend=backend, device=device,
+            use_dynamic_window=use_dynamic_window,
+            residual_window=residual_window,
+            seed=seed, verbose=verbose,
+        )
+
+    @torch.no_grad()
+    def compress_kv(
+        self, keys: torch.Tensor, values: torch.Tensor,
+    ) -> Tuple[dict, dict]:
+        B, H, S, D = keys.shape
+        rw = self._compute_window(S)
+        if rw >= S:
+            return self._wrap_fp16(keys), self._wrap_fp16(values)
+        split_at = S - rw
+        old_k, new_k = keys[..., :split_at, :], keys[..., split_at:, :]
+        old_v, new_v = values[..., :split_at, :], values[..., split_at:, :]
+        return (
+            {"compressed": self._key_comp.compress(old_k), "fp16": new_k,
+             "shape": (B, H, S, D), "split_at": split_at, "rw": rw},
+            {"compressed": self._val_comp.compress(old_v), "fp16": new_v,
+             "shape": (B, H, S, D), "split_at": split_at, "rw": rw},
+        )
+
+    @torch.no_grad()
+    def decompress_kv(self, ck: dict, cv: dict) -> Tuple[torch.Tensor, torch.Tensor]:
+        if ck.get("fp16_only"):
+            return ck["fp16"], cv["fp16"]
+        old_k = self._key_comp.decompress(ck["compressed"])
+        old_v = self._val_comp.decompress(cv["compressed"])
+        return torch.cat([old_k, ck["fp16"]], dim=2), \
+               torch.cat([old_v, cv["fp16"]], dim=2)
+
+    def _compute_window(self, seq_len: int) -> int:
+        from turboquant import compute_residual_window
+        if self._use_dynamic_window:
+            return compute_residual_window(seq_len, base=self._residual_window)
+        return min(self._residual_window, seq_len)
+
+    def _wrap_fp16(self, x: torch.Tensor) -> dict:
+        return {"fp16": x, "fp16_only": True, "shape": x.shape}
+
+    def memory_usage(self, B: int, H: int, S: int) -> dict:
+        rw = self._compute_window(S)
+        fp16_total = B * H * S * self._head_dim * 2 * 2
+        if rw >= S:
+            return {"compressed_mb": fp16_total / 1e6, "fp16_mb": fp16_total / 1e6,
+                    "compression_ratio": 1.0, "backend": self._backend_name}
+        comp_S = max(S - rw, 0)
+        comp = comp_S * B * H * (self._key_comp.n_bytes + self._val_comp.n_bytes)
+        fp16_win = B * H * rw * self._head_dim * 2 * 2
+        total = comp + fp16_win
+        return {
+            "compressed_mb": total / 1e6,
+            "fp16_mb": fp16_total / 1e6,
+            "compression_ratio": fp16_total / total if total > 0 else 0,
+            "backend": self._backend_name,
+        }
+
+    @property
+    def backend_info(self) -> dict:
+        return get_env().summary()
+
+    @property
+    def mode(self) -> str:
+        return "standard"
+
+    def print_config(self):
+        print(f"[TurboQuant Pipeline] 模式=standard  bits=K{self._key_bits}+V{self._value_bits}  "
+              f"后端={self._backend_name}  设备={self._device}")
+
+
+# ===========================================================================
+# 第五步：PyramidTurboQuantPipeline（金字塔层分配模式）
+# ===========================================================================
+
+class PyramidTurboQuantPipeline:
+    """
+    金字塔 TurboQuant 流水线（Per-Layer Bit Allocation）。
+
+    核心思想（PyramidKV）：
+      - 浅层（低 index）：注意力分布广泛，KV 信息丰富 → 多 bits（高质量）
+      - 深层（高 index）：注意力高度聚焦，冗余多 → 少 bits（高压缩）
+
+    与 TurboQuantPipeline 的区别：
+      - 各层使用不同 bits（自动分配）
+      - 支持 PyramidKV 风格保护层（首尾若干层高保真）
+      - 内存预算相同，质量更高
+
+    内存公式（假设 30 层，S=4096，H=32，D=128）：
+      均匀 (4+2bit):  2 × 30 × 4096 × 32 × 128 × (6/16) = ~192 MB
+      金字塔 (8→2):   2 × 30 × 4096 × 32 × 128 × (5/16) = ~160 MB（节省 17%）
+      含保护层:        同内存预算，但质量更高
+
+    用法：
+      >>> kv = PyramidTurboQuantPipeline.create(n_layers=30, head_dim=128)
+      >>> kv.print_config()       # 打印每层 bits 分配
+      >>> for i in range(30):
+      ...     compressed[i] = kv.compress_kv_layer(i, layer_keys[i], layer_values[i])
+    """
+
+    def __init__(
+        self,
+        n_layers: int,
+        head_dim: int = 128,
+        base_key_bits: int = 4,
+        base_value_bits: int = 2,
+        *,
+        pyramid_max_bits: int = 6,
+        pyramid_min_bits: int = 3,
+        pyramid_alpha: float = 1.0,
+        protected_layers: int = 2,
+        residual_window: int = 128,
+        seed: int = 42,
+        device: Optional[str] = None,
+        backend: Optional[str] = None,
+        verbose: bool = True,
+        mode: Literal["uniform", "pyramid"] = "pyramid",
+    ):
+        from pyramid_alloc import LayerBitAllocator, LayerBudget
+
+        env = get_env()
+        self._backend_name = backend or env.backend
+        self._device = device or env.selected_device
+        self._n_layers = n_layers
+        self._head_dim = head_dim
+        self._seed = seed
+        self._residual_window = residual_window
+
+        # 层 bits 分配
+        self._allocator = LayerBitAllocator(
+            n_layers=n_layers,
+            base_key_bits=base_key_bits,
+            base_value_bits=base_value_bits,
+            pyramid_max_bits=pyramid_max_bits,
+            pyramid_min_bits=pyramid_min_bits,
+            pyramid_alpha=pyramid_alpha,
+            protected_layers=protected_layers,
+        )
+        self._budget = self._allocator.allocate(mode)
+
+        # 每层一个压缩器（key/value 各自）
+        from turboquant import LloydMaxCodebook, BitPacker
+        self._key_comps: List[_CompressorWrapper] = []
+        self._val_comps: List[_CompressorWrapper] = []
+
+        for i, lb in enumerate(self._budget.layers):
+            k_comp = self._make_compressor(lb.key_bits, seed + i * 1000)
+            v_comp = self._make_compressor(lb.value_bits, seed + i * 1000 + 999)
+            self._key_comps.append(k_comp)
+            self._val_comps.append(v_comp)
+
+        if verbose:
+            print(f"[TurboQuant] 模式={'pyramid' if mode=='pyramid' else 'uniform'}  "
+                  f"n_layers={n_layers}  后端={self._backend_name}")
+            self.print_config()
+
+    def _make_compressor(self, bits: int, seed: int) -> _CompressorWrapper:
+        from turboquant import LloydMaxCodebook, BitPacker
+        rot = create_rotation_backend(
+            d=self._head_dim, backend=self._backend_name,
+            seed=seed, device=self._device,
+        )
+        codebook = LloydMaxCodebook(self._head_dim, bits)
+        centroids = codebook.centroids.to(self._device)
+        packer = BitPacker(self._head_dim, bits)
+        return _CompressorWrapper(self._head_dim, bits, rot, centroids, packer)
+
+    @staticmethod
+    def create(
+        n_layers: int,
+        head_dim: int = 128,
+        base_key_bits: int = 4,
+        base_value_bits: int = 2,
+        *,
+        pyramid_max_bits: int = 6,
+        pyramid_min_bits: int = 3,
+        pyramid_alpha: float = 1.0,
+        protected_layers: int = 2,
+        residual_window: int = 128,
+        seed: int = 42,
+        device: Optional[str] = None,
+        backend: Optional[str] = None,
+        verbose: bool = True,
+        report: bool = False,
+        mode: Literal["uniform", "pyramid"] = "pyramid",
+    ) -> 'PyramidTurboQuantPipeline':
+        if report:
+            get_env().print_report()
+        return PyramidTurboQuantPipeline(
+            n_layers=n_layers, head_dim=head_dim,
+            base_key_bits=base_key_bits, base_value_bits=base_value_bits,
+            pyramid_max_bits=pyramid_max_bits, pyramid_min_bits=pyramid_min_bits,
+            pyramid_alpha=pyramid_alpha, protected_layers=protected_layers,
+            residual_window=residual_window, seed=seed,
+            device=device, backend=backend, verbose=verbose, mode=mode,
+        )
+
+    @torch.no_grad()
+    def compress_kv(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        layer_idx: int = 0,
+    ) -> Tuple[dict, dict]:
+        """
+        压缩指定层的 KV。
+
+        参数:
+            keys/values: (B, H, S, D)
+            layer_idx:   层索引（决定使用哪个 bit 配置）
+        """
+        rw = min(self._residual_window, keys.shape[2])
+        B, H, S, D = keys.shape
+        if rw >= S:
+            return self._wrap_fp16(keys), self._wrap_fp16(values)
+        split_at = S - rw
+        old_k, new_k = keys[..., :split_at, :], keys[..., split_at:, :]
+        old_v, new_v = values[..., :split_at, :], values[..., split_at:, :]
+        return (
+            {"compressed": self._key_comps[layer_idx].compress(old_k),
+             "fp16": new_k, "shape": (B, H, S, D), "split_at": split_at,
+             "rw": rw, "layer_idx": layer_idx},
+            {"compressed": self._val_comps[layer_idx].compress(old_v),
+             "fp16": new_v, "shape": (B, H, S, D), "split_at": split_at,
+             "rw": rw, "layer_idx": layer_idx},
+        )
+
+    @torch.no_grad()
+    def decompress_kv(
+        self, ck: dict, cv: dict,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if ck.get("fp16_only"):
+            return ck["fp16"], cv["fp16"]
+        layer_idx = ck.get("layer_idx", 0)
+        old_k = self._key_comps[layer_idx].decompress(ck["compressed"])
+        old_v = self._val_comps[layer_idx].decompress(cv["compressed"])
+        return torch.cat([old_k, ck["fp16"]], dim=2), \
+               torch.cat([old_v, cv["fp16"]], dim=2)
+
+    def compress_batch(
+        self,
+        keys_per_layer: Dict[int, torch.Tensor],
+        values_per_layer: Dict[int, torch.Tensor],
+    ) -> Dict[int, Tuple[dict, dict]]:
+        """
+        批量压缩所有层的 KV。
+
+        参数:
+            keys_per_layer:   {layer_idx: (B, H, S, D)}
+            values_per_layer: {layer_idx: (B, H, S, D)}
+        返回:
+            {layer_idx: (compressed_keys, compressed_values)}
+        """
+        results = {}
+        for i in range(self._n_layers):
+            if i in keys_per_layer and i in values_per_layer:
+                ck, cv = self.compress_kv(keys_per_layer[i], values_per_layer[i], layer_idx=i)
+                results[i] = (ck, cv)
+        return results
+
+    def memory_usage(self, B: int, H: int, S: int) -> dict:
+        """汇总所有层的内存用量"""
+        total_compressed = 0
+        total_fp16 = 0
+        layer_reports = []
+        for i in range(self._n_layers):
+            rw = min(self._residual_window, S)
+            fp16_layer = B * H * S * self._head_dim * 2 * 2
+            total_fp16 += fp16_layer
+            if rw >= S:
+                total_compressed += fp16_layer
+            else:
+                comp_S = max(S - rw, 0)
+                comp_bytes = comp_S * B * H * (
+                    self._key_comps[i].n_bytes + self._val_comps[i].n_bytes
+                )
+                fp16_win = B * H * rw * self._head_dim * 2 * 2
+                total_compressed += comp_bytes + fp16_win
+            lb = self._budget.layers[i]
+            layer_reports.append({
+                "layer": i, "key_bits": lb.key_bits, "value_bits": lb.value_bits,
+                "total_bits": lb.total_bits,
+                "is_protected": lb.is_protected,
+            })
+        return {
+            "total_compressed_mb": total_compressed / 1e6,
+            "total_fp16_mb": total_fp16 / 1e6,
+            "compression_ratio": total_fp16 / total_compressed if total_compressed > 0 else 0,
+            "layers": layer_reports,
+            "mode": "pyramid" if self._budget.use_pyramid else "uniform",
+            "backend": self._backend_name,
+        }
+
+    def print_config(self):
+        print(f"  {'层':>4} | {'K bits':>6} | {'V bits':>6} | {'总量':>6} | {'保护':>4}")
+        print("  " + "-" * 38)
+        for i, lb in enumerate(self._budget.layers):
+            prot = "✅" if lb.is_protected else "  "
+            print(f"  L{i:02d}   | K={lb.key_bits:1d}b     | V={lb.value_bits:1d}b     | "
+                  f"{lb.total_bits:3d}b    | {prot}")
+        print()
+
+    @property
+    def budget(self) -> 'LayerBudget':
+        return self._budget
+
+    @property
+    def backend_info(self) -> dict:
+        return get_env().summary()
+
+    @property
+    def mode(self) -> str:
+        return "pyramid" if self._budget.use_pyramid else "uniform"
+
+
+# ===========================================================================
+# 第六步：HybridTurboQuantPipeline（驱逐 + 量化混合模式）
+# ===========================================================================
+
+class HybridTurboQuantPipeline:
+    """
+    混合 TurboQuant 流水线（SnapKV 驱逐 + TurboQuant 量化）。
+
+    工作流程：
+      1. 推理时：追踪注意力分数（track_attention）
+      2. Prefill 结束后：根据 importance 驱逐低分 token（evict）
+      3. 对保留 token 压缩（compress）
+      4. Decode 时：对新 token 压缩，不驱逐（append）
+
+    核心公式：
+      内存降低 = 驱逐倍率 × 量化倍率
+             = 1/p × 16/(K+V)
+             = 1/0.2 × 16/6 = 13.3x（p=0.2, K=4, V=2）
+    """
+
+    def __init__(
+        self,
+        n_layers: int,
+        head_dim: int = 128,
+        key_bits: int = 4,
+        value_bits: int = 2,
+        *,
+        eviction_strategy: str = "heavy_hitter",
+        retention_ratio: float = 0.2,
+        window_size: int = 512,
+        recent_window: int = 128,
+        residual_window: int = 64,
+        seed: int = 42,
+        device: Optional[str] = None,
+        backend: Optional[str] = None,
+        verbose: bool = True,
+    ):"""
+
+        from hybrid_quant import AttentionTracker, TokenEvictor, HybridTurboQuant, TokenImportance
+        from turboquant import LloydMaxCodebook, BitPacker
+
+        env = get_env()
+        self._backend_name = backend or env.backend
+        self._device = device or env.selected_device
+        self._n_layers = n_layers
+        self._head_dim = head_dim
+        self._key_bits = key_bits
+        self._value_bits = value_bits
+        self._retention_ratio = retention_ratio
+        self._seed = seed
+        self._residual_window = residual_window
+
+        self._turboquants: List[HybridTurboQuant] = []
+        for i in range(n_layers):
+            tq = HybridTurboQuant(
+                head_dim=head_dim,
+                key_bits=key_bits,
+                value_bits=value_bits,
+                eviction_strategy=eviction_strategy,
+                retention_ratio=retention_ratio,
+                window_size=window_size,
+                recent_window=recent_window,
+                residual_window=residual_window,
+                seed=seed + i,
+                device=self._device,
+                mode="snapkv_turbo",
+            )
+            self._turboquants.append(tq)
+
+        self._tracker = AttentionTracker(
+            seq_len=0,
+            n_heads=0,
+            head_dim=head_dim,
+            device=self._device,
+        )
+        self._importance: Optional[TokenImportance] = None
+        self._evicted_state: Optional[Dict] = None
+
+        if verbose:
+            theory_ratio = (1.0 / retention_ratio) * (16.0 / (key_bits + value_bits))
+            print("[TurboQuant] 模式=hybrid  eviction=" + eviction_strategy + "  "
+                  "retention=" + f"{retention_ratio:.0%}" + "  后端=" + self._backend_name + "  "
+                  "设备=" + self._device)
+            print("  理论压缩: ~" + f"{theory_ratio:.1f}" + "x")
+
+    @staticmethod
+    def create(
+        n_layers: int,
+        head_dim: int = 128,
+        key_bits: int = 4,
+        value_bits: int = 2,
+        *,
+        eviction_strategy: str = "heavy_hitter",
+        retention_ratio: float = 0.2,
+        window_size: int = 512,
+        recent_window: int = 128,
+        residual_window: int = 64,
+        seed: int = 42,
+        device: Optional[str] = None,
+        backend: Optional[str] = None,
+        verbose: bool = True,
+        report: bool = False,
+    ) -> "HybridTurboQuantPipeline":
+        if report:
+            get_env().print_report()
+        return HybridTurboQuantPipeline(
+            n_layers=n_layers, head_dim=head_dim,
+            key_bits=key_bits, value_bits=value_bits,
+            eviction_strategy=eviction_strategy,
+            retention_ratio=retention_ratio,
+            window_size=window_size, recent_window=recent_window,
+            residual_window=residual_window,
+            seed=seed, device=device, backend=backend, verbose=verbose,
+        )
+
+    def track_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+    ) -> None:
+        """Track attention scores during inference."""
+        if q.dim() == 4:
+            B, H, S, D = q.shape
+        else:
+            H, S, D = q.shape
+
+        if self._tracker.seq_len != S:
+            self._tracker.seq_len = S
+            self._tracker._cum_scores = None
+            self._tracker._update_count = 0
+
+        self._tracker.update_attention_approx(q, k, obs_only=True)
+
+    def finalize_importance(self, retention_ratio: Optional[float] = None) -> TokenImportance:
+        """Finalize importance distribution after prefill."""
+        p = retention_ratio or self._retention_ratio
+        self._importance = self._tracker.get_importance(
+            retention_ratio=p,
+            recent_bias=0.3,
+        )
+        return self._importance
+
+    @torch.no_grad()
+    def evict_and_compress(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        layer_idx: int = 0,
+        importance: Optional[TokenImportance] = None,
+    ) -> Dict[str, Any]:
+        """Evict + compress (call once after prefill)."""
+        imp = importance or self._importance
+        if imp is None:
+            imp = self.finalize_importance()
+
+        tq = self._turboquants[layer_idx]
+        comp = tq.compress(keys, values, importance=imp)
+
+        self._evicted_state = {
+            "importance": imp,
+            "layer_idx": layer_idx,
+        }
+
+        return {
+            "compressed_keys": comp["compressed"]["keys"],
+            "compressed_values": comp["compressed"]["values"],
+            "importance": imp,
+            "eviction_stats": comp["eviction_stats"],
+            "original_shape": comp["original_shape"],
+            "layer_idx": layer_idx,
+        }
+
+    @torch.no_grad()
+    def compress_new_tokens(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        state: Dict,
+    ) -> Dict[str, Any]:
+        """Compress new tokens (call each decode step)."""
+        layer_idx = state.get("layer_idx", 0)
+        tq = self._turboquants[layer_idx]
+        kept_k, kept_v, _ = tq.evictor.evict(keys, values, importance=None)
+        if kept_k.numel() == 0:
+            kept_k, kept_v = keys, values
+        tq_k = tq._get_turboquant()
+        ck = tq_k.compress_kv(kept_k, kept_v)[0]
+        tq_v = tq._get_turboquant()
+        cv = tq_v.compress_kv(kept_k, kept_v)[1]
+        return {
+            "compressed_keys": ck,
+            "compressed_values": cv,
+            "importance": state.get("importance"),
+            "layer_idx": layer_idx,
+        }
+
+    @torch.no_grad()
+    def decompress(self, state: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Decompress back to original KV (evicted positions = zero)."""
+        layer_idx = state.get("layer_idx", 0)
+        comp = {
+            "compressed": {
+                "keys": state["compressed_keys"],
+                "values": state["compressed_values"],
+            },
+            "importance": state.get("importance"),
+            "original_shape": state["original_shape"],
+        }
+        tq = self._turboquants[layer_idx]
+        return tq.decompress(comp)
+
+    def memory_usage(self, B: int, H: int, S: int, D: int) -> dict:
+        tq = self._turboquants[0]
+        mem = tq.memory_usage(B, H, S, D)
+        total_fp16 = 2 * B * H * S * D * 2
+        return {
+            "hybrid_mb": mem["hybrid_bytes"] / 1e6,
+            "fp16_mb": total_fp16 / 1e6,
+            "compression_ratio": mem["hybrid_ratio"],
+            "eviction_ratio": mem["eviction_ratio"],
+            "turbo_ratio": mem["turbo_ratio"],
+            "mode": "hybrid",
+            "backend": self._backend_name,
+        }
+
+    @property
+    def backend_info(self) -> dict:
+        return get_env().summary()
+
+    @property
+    def mode(self) -> str:
+        return "hybrid"
+
+    def print_config(self):
+        theory_ratio = (1.0 / self._retention_ratio) * (16.0 / (self._key_bits + self._value_bits))
+        print("[HybridTurboQuant Pipeline] eviction=heavy_hitter  "
+              "retention=" + f"{self._retention_ratio:.0%}" + "  "
+              "K=" + str(self._key_bits) + "b V=" + str(self._value_bits) + "b")
+        print("  理论降低: ~" + f"{theory_ratio:.1f}" + "x")
+
+
+# ===========================================================================
+# Step 7: Unified Factory
+# ===========================================================================
+
+def create(
+    head_dim: int = 128,
+    key_bits: int = 4,
+    value_bits: int = 2,
+    *,
+    mode: Literal["standard", "pyramid", "hybrid"] = "standard",
+    n_layers: Optional[int] = None,
+    pyramid_max_bits: int = 6,
+    pyramid_min_bits: int = 3,
+    pyramid_alpha: float = 1.0,
+    protected_layers: int = 2,
+    eviction_strategy: str = "heavy_hitter",
+    retention_ratio: float = 0.2,
+    window_size: int = 512,
+    recent_window: int = 128,
+    residual_window: int = 128,
+    backend: Optional[str] = None,
+    device: Optional[str] = None,
+    seed: int = 42,
+    verbose: bool = True,
+    report: bool = False,
+) -> Any:
+    """
+    Unified factory (recommended entry point).
+
+    Args:
+        mode: "standard" = uniform bits allocation (baseline)
+              "pyramid"  = PyramidKV per-layer allocation (recommended)
+              "hybrid"   = SnapKV eviction + TurboQuant (~13x max compression)
+
+        n_layers: model layer count (required for pyramid/hybrid)
+        retention_ratio: 0.2 = keep 20%, evict 80%
+    """
+    if report:
+        get_env().print_report()
+
+    if mode == "standard":
+        return TurboQuantPipeline.create(
+            head_dim=head_dim, key_bits=key_bits, value_bits=value_bits,
+            backend=backend, device=device,
+            residual_window=residual_window, seed=seed, verbose=verbose,
+        )
+
+    if mode == "pyramid":
+        if n_layers is None:
+            raise ValueError("pyramid mode requires n_layers")
+        return PyramidTurboQuantPipeline.create(
+            n_layers=n_layers, head_dim=head_dim,
+            base_key_bits=key_bits, base_value_bits=value_bits,
+            pyramid_max_bits=pyramid_max_bits, pyramid_min_bits=pyramid_min_bits,
+            pyramid_alpha=pyramid_alpha, protected_layers=protected_layers,
+            residual_window=residual_window, seed=seed,
+            device=device, backend=backend, verbose=verbose,
+        )
+
+    if mode == "hybrid":
+        if n_layers is None:
+            raise ValueError("hybrid mode requires n_layers")
+        return HybridTurboQuantPipeline.create(
+            n_layers=n_layers, head_dim=head_dim,
+            key_bits=key_bits, value_bits=value_bits,
+            eviction_strategy=eviction_strategy, retention_ratio=retention_ratio,
+            window_size=window_size, recent_window=recent_window,
+            residual_window=residual_window, seed=seed,
+            device=device, backend=backend, verbose=verbose,
+        )
+
+    raise ValueError(f"Unknown mode: {mode}. Use: standard | pyramid | hybrid")
+
+
+def compress(
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    head_dim: int = 128,
+    key_bits: int = 4,
+    value_bits: int = 2,
+    backend: Optional[str] = None,
+    **kwargs,
+) -> Tuple[dict, dict, dict]:
+    """One-line compress API (standard mode)."""
+    pipeline = TurboQuantPipeline.create(
+        head_dim=head_dim, key_bits=key_bits, value_bits=value_bits,
+        backend=backend, verbose=False, **kwargs
+    )
+    ck, cv = pipeline.compress_kv(keys, values)
+    return ck, cv, pipeline.backend_info
+
+
+def decompress(
+    ck: dict, cv: dict,
+    pipeline_info: Optional[dict] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """One-line decompress API."""
+    device = (pipeline_info or {}).get("device", "cpu")
+    pipeline = TurboQuantPipeline.create(
+        head_dim=ck.get("shape", (1, 1, 1, 128))[-1],
+        backend=(pipeline_info or {}).get("backend"),
+        device=device, verbose=False,
+    )
+    return pipeline.decompress_kv(ck, cv)
+
+
+def benchmark(
+    head_dim: int = 128,
+    batch: int = 2,
+    heads: int = 8,
+    seq_len: int = 512,
+    key_bits: int = 4,
+    value_bits: int = 2,
+    mode: Literal["standard", "pyramid", "hybrid"] = "standard",
+    n_runs: int = 100,
+) -> dict:
+    """Performance benchmark."""
+    import time
+
+    keys = torch.randn(batch, heads, seq_len, head_dim)
+    values = torch.randn(batch, heads, seq_len, head_dim)
+
+    if mode == "standard":
+        pipeline = TurboQuantPipeline.create(head_dim, key_bits, value_bits, verbose=False)
+    elif mode == "pyramid":
+        pipeline = PyramidTurboQuantPipeline.create(
+            n_layers=8, head_dim=head_dim,
+            base_key_bits=key_bits, base_value_bits=value_bits,
+            verbose=False,
+        )
+    else:
+        pipeline = HybridTurboQuantPipeline.create(
+            n_layers=8, head_dim=head_dim,
+            key_bits=key_bits, value_bits=value_bits,
+            retention_ratio=0.2, verbose=False,
+        )
+
+    # Warmup
+    for _ in range(3):
+        if mode == "standard":
+            ck, cv = pipeline.compress_kv(keys, values)
+            pipeline.decompress_kv(ck, cv)
+        elif mode == "pyramid":
+            ck, cv = pipeline.compress_kv(keys, values, layer_idx=0)
+            pipeline.decompress_kv(ck, cv)
+        else:
+            from hybrid_quant import TokenImportance
+            imp = TokenImportance(
+                scores=torch.rand(seq_len),
+                kept_indices=torch.randperm(seq_len)[:int(seq_len * 0.2)],
+                evicted_indices=torch.tensor([], dtype=torch.long),
+                retention_ratio=0.2,
+            )
+            state = pipeline.evict_and_compress(keys, values, importance=imp)
+
+    # Benchmark
+    t0 = time.perf_counter()
+    for _ in range(n_runs):
+        if mode == "standard":
+            pipeline.compress_kv(keys, values)
+        elif mode == "pyramid":
+            pipeline.compress_kv(keys, values, layer_idx=0)
+        else:
+            pipeline.evict_and_compress(keys, values, importance=imp)
+    t_compress = (time.perf_counter() - t0) / n_runs * 1000
+
+    result = {
+        "mode": mode,
+        "backend": pipeline._backend_name,
+        "device": pipeline._device,
+        "head_dim": head_dim,
+        "batch": batch,
+        "heads": heads,
+        "seq_len": seq_len,
+        "key_bits": key_bits,
+        "value_bits": value_bits,
+        "n_runs": n_runs,
+        "compress_ms": round(t_compress, 3),
+    }
+
+    sep = "=" * 50
+    print(f"\n{sep}")
+    print(f"  TurboQuant Benchmark  (mode={mode}, backend={pipeline._backend_name})")
+    print(f"{sep}")
+    print(f"  shape: ({batch}B, {heads}heads, {seq_len}seq, {head_dim}d)")
+    print(f"  precision: key={key_bits}bit  value={value_bits}bit")
+    print(f"  compress latency: {t_compress:.2f}ms/call")
+    print(f"{sep}")
+
+    return result
+
+
+__all__ = [
+    "TurboQuantPipeline",
+    "PyramidTurboQuantPipeline",
+    "HybridTurboQuantPipeline",
+    "create",
+    "compress",
+    "decompress",
+    "benchmark",
+    "get_env",
+    "EnvironmentInfo",
+]

@@ -1,0 +1,8 @@
+def _rotate_fwht(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        FWHT 旋转：x ⊙ sign → butterfly → ⊙ sign / √d
+
+        x ⊙ sign → butterfly → ⊙ sign / √d
+        = (H @ (x ⊙ sign)) ⊙ sign / √d
+        = (x ⊙ sign) @ H ⊙ sign / √d（因为 H 对称）
+ 

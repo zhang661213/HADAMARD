@@ -1,0 +1,11 @@
+def _unrotate_fwht(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        FWHT 逆旋转：y → butterfly → ⊙ sign / √d
+
+        y → butterfly → ⊙ sign / √d
+        = (H @ y) ⊙ sign / √d
+        = y @ Q ✓
+        """
+        yr = y.clone()
+        self._fwht分层(yr)
+     

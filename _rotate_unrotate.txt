@@ -1,0 +1,61 @@
+def _unrotate_fwht(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        FWHT 逆旋转：y → butterfly → ⊙ sign / √d
+
+        y → butterfly → ⊙ sign / √d
+        = (H @ y) ⊙ sign / √d
+        = y @ Q ✓
+        """
+        yr = y.clone()
+        self._fwht分层(yr)
+        yr = yr * self.signs / self._sqrt_d
+        return yr
+
+    def _fwht分层(self, x: torch.Tensor):
+        """
+        Walsh-Hadamard butterfly 变换（原地，优化3：FP32累加+动态缩放）。
+
+        优化内容：
+        1. FP32 累加器：低精度输入时用 float32 计算 u±v
+        2. 动态缩放：每级 butterfly 后检测溢出，超阈值则 ×0.5
+        3. 原地写回：避免额外内存分配
+
+        每层 butterfly 后 /√2，最大放大 √d 倍（d=4096 → 64×）。
+        但动态缩放保证极端输入也不会溢出。
+        """
+        d = x.shape[-1]
+        if d == 1:
+            return
+
+        # ---- 优化3：FP32 累加 + 动态缩放 ----
+        use_fp32 = x.dtype in (torch.float16, torch.bfloat16)
+        compute_dtype = torch.float32 if use_fp32 else x.dtype
+
+        # 缩放阈值：留 10% margin
+        if compute_dtype == torch.float32:
+            threshold = 3.4e38 * 0.9
+        else:  # FP16
+            threshold = 6.0e4 * 0.9
+
+        half_sqrt = math.sqrt(0.5)
+        stride = 1
+        scale_count = 0
+
+        while stride < d:
+            all_idx = torch.arange(d, device=x.device)
+            mask = (all_idx & stride) == 0
+            idx0 = all_idx[mask]
+            idx1 = idx0 ^ stride
+
+            u = x[..., idx0].to(compute_dtype)
+            v = x[..., idx1].to(compute_dtype)
+
+            # Butterfly + 分层缩放（在 FP32 累加器中计算）
+            t = (u + v) * half_sqrt
+            d_val = (u - v) * half_sqrt
+
+            # 动态溢出检测
+            cur_max = max(t.abs().max().item(), d_val.abs().max().item())
+            if cur_max > threshold:
+                t = t * 0.5
+   

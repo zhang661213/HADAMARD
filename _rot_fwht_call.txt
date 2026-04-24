@@ -1,0 +1,19 @@
+_rotate_fwht(x)
+
+    def unrotate(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        unrotate(y) = y @ Q = (H @ y) ⊙ sign / √d
+        """
+        if y.device != self.device:
+            y = y.to(self.device)
+        if self.mode == "matmul":
+            if y.dim() == 1:
+                return (torch.mv(self._Q_T.t(), y) * self.signs)
+            else:
+                return (torch.mm(y, self._Q_T.t()) * self.signs.view(1, -1))
+        else:
+            return self._unrotate_fwht(y)
+
+    def _rotate_fwht(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        FWHT 旋转：x �
